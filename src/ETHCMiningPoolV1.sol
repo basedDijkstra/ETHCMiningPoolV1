@@ -1,5 +1,5 @@
-// SPDX-License-Identifier: UNLICENSED
-pragma solidity ^0.8.26;
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.27;
 
 abstract contract Ownable {
     address private _owner;

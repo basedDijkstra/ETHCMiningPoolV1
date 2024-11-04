@@ -1,5 +1,5 @@
-// SPDX-License-Identifier: UNLICENSED
-pragma solidity ^0.8.13;
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.27;
 
 import {Test, console2} from "forge-std/Test.sol";
 import {ETHCoinMiningPoolV1} from "../src/ETHCMiningPoolV1.sol";

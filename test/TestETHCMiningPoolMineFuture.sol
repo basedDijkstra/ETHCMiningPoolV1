@@ -1,5 +1,5 @@
-// SPDX-License-Identifier: UNLICENSED
-pragma solidity ^0.8.13;
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.27;
 
 import {Test, console2} from "forge-std/Test.sol";
 import {ETHCoinMiningPoolV1, IETHC} from "../src/ETHCMiningPoolV1.sol";
@@ -7,7 +7,7 @@ import {TestToken} from "./mocks/TestETHC.sol";
 
 import "forge-std/console.sol";
 
-contract TestETHCMiningPoolMine is Test {
+contract TestETHCMiningPoolMineFuture is Test {
     ETHCoinMiningPoolV1 public pool;
     TestToken public ETHC;
     address public constant WETH = address(0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2);
