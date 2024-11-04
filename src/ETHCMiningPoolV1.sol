@@ -130,10 +130,10 @@ interface IETHC {
 
     function mine(uint256 mineCount) external payable;
     function futureMine(uint256 mineCount, uint256 blockCounts) external payable;
-    function revealSelectedMiner(uint256 targetBlock) external;
 
     function miningReward() external view returns (uint256);
-    function selectedMinerOfBlock(uint256 _blockNumber) external view returns (address);
+    function nextHalvingBlock() external view returns (uint256);
+    function halvingInterval() external view returns (uint256);
     function minersOfBlockCount(uint256 _blockNumber) external view returns (uint256);
     function blockNumber() external view returns (uint256);
     function mineCost() external view returns (uint256);
@@ -849,7 +849,7 @@ interface IUniswapV3FlashCallback {
  *    - Fee is added to borrowed amount for required repayment
  *    - Example: Borrowing 1000 ETHC requires repayment of 1002 ETHC
  */
-contract ETHCoinMiningPool is ERC20, Ownable, ReentrancyGuard, IUniswapV3Pool {
+contract ETHCoinMiningPoolV1 is ERC20, Ownable, ReentrancyGuard, IUniswapV3Pool {
     IETHC public ETHC;
     bool public miningPaused = false;
     bool public flashPaused = false;
@@ -878,6 +878,8 @@ contract ETHCoinMiningPool is ERC20, Ownable, ReentrancyGuard, IUniswapV3Pool {
     /// @dev All fee calculations use this as the denominator to determine percentages
     uint256 public operatorFeeDenom = 10000;
 
+    mapping(uint256 => uint256) public blockRewardCache;
+
     address public token0;
     address public token1;
 
@@ -898,10 +900,16 @@ contract ETHCoinMiningPool is ERC20, Ownable, ReentrancyGuard, IUniswapV3Pool {
     event SharesRedeemed(address indexed redeemer, uint256 shares, uint256 reward);
     event FlashLoanExecuted(address indexed borrower, uint256 amount, uint256 fee);
     event MiningExecuted(
-        address indexed miner, uint256 mineCount, uint256 blockReward, uint256 shares, uint256 feeAmount
+        address indexed miner,
+        uint256 indexed blockNumber,
+        uint256 mineCount,
+        uint256 blockReward,
+        uint256 shares,
+        uint256 feeAmount
     );
     event FutureMiningExecuted(
         address indexed miner,
+        uint256 indexed blockNumber,
         uint256 mineCount,
         uint256 blockCounts,
         uint256 blockReward,
@@ -1003,7 +1011,11 @@ contract ETHCoinMiningPool is ERC20, Ownable, ReentrancyGuard, IUniswapV3Pool {
      * @dev Only callable by owner
      */
     function setBlockWeights(uint256 newLastBlockWeight, uint256 newCurrentBlockWeight) external onlyOwner {
-        require(newLastBlockWeight > 0 && newCurrentBlockWeight > 0, "Weights must be positive");
+        require(newLastBlockWeight + newCurrentBlockWeight > 0, "At least one weight must be greater than 0");
+        require(
+            newLastBlockWeight + newCurrentBlockWeight < 100000,
+            "Total denominator of weights must be no more than 100000"
+        );
         emit BlockWeightsUpdated(lastBlockWeight, newLastBlockWeight, currentBlockWeight, newCurrentBlockWeight);
         lastBlockWeight = newLastBlockWeight;
         currentBlockWeight = newCurrentBlockWeight;
@@ -1031,13 +1043,12 @@ contract ETHCoinMiningPool is ERC20, Ownable, ReentrancyGuard, IUniswapV3Pool {
      * - FeeCollected event if operator fee is charged
      */
     function mine(uint256 mineCount) external payable nonReentrant {
-        _mine(mineCount, msg.value);
+        _mine(mineCount);
     }
 
     /**
      * @notice Internal function to process mining operations and mint shares
      * @param mineCount Number of mining operations to perform
-     * @param ethValue Amount of ETH provided for mining
      * @dev Calculates shares based on:
      * 1. Current block reward
      * 2. Weighted average of miners across blocks
@@ -1048,34 +1059,35 @@ contract ETHCoinMiningPool is ERC20, Ownable, ReentrancyGuard, IUniswapV3Pool {
      * - Scaling rewards based on block participation
      * - Applying proportional operator fees
      */
-    function _mine(uint256 mineCount, uint256 ethValue) internal {
+    function _mine(uint256 mineCount) internal {
         require(!miningPaused, "Mining is paused");
 
         uint256 blockNumber = ETHC.blockNumber();
-        uint256 lastBlockMiners = ETHC.minersOfBlockCount(blockNumber) * lastBlockWeight;
-        uint256 nextBlockMiners = ETHC.minersOfBlockCount(blockNumber + 1) * currentBlockWeight;
-        IETHC.Block memory nextBlock = ETHC.blocks(blockNumber + 1);
+        uint256 blockReward = _miningReward(blockNumber + 1);
 
-        uint256 blockReward = nextBlock.miningReward == 0 ? ETHC.miningReward() : nextBlock.miningReward;
-
-        // Calculate weighted average miners and resulting shares
-        uint256 weightedAvgMiners = (lastBlockMiners + nextBlockMiners) / (lastBlockWeight + currentBlockWeight);
-        uint256 shares = blockReward * mineCount / weightedAvgMiners;
-
-        // Calculate and deduct operator fee
-        uint256 feeAmount = shares * operatorFeeNum / operatorFeeDenom;
+        (uint256 shares, uint256 fee) = _calculateSharesAndFee(
+            mineCount,
+            1, // 1 block
+            blockNumber,
+            blockReward
+        );
 
         // Execute mining through vault
-        vault.mine{value: ethValue}(mineCount);
+        vault.mine{value: mineCount * ETHC.mineCost()}(mineCount);
 
         // Mint shares to miner and operator
-        _mint(msg.sender, shares - feeAmount);
-        if (feeAmount > 0) {
-            _mint(operatorAddress, feeAmount);
-            emit FeeCollected(msg.sender, feeAmount);
+        _mint(msg.sender, shares);
+        if (fee > 0 && operatorAddress != address(0)) {
+            _mint(operatorAddress, fee);
+        } else if (operatorAddress == address(0)) {
+            _mint(msg.sender, fee);
         }
 
-        emit MiningExecuted(msg.sender, mineCount, blockReward, shares, feeAmount);
+        emit MiningExecuted(msg.sender, blockNumber + 1, mineCount, blockReward, shares, fee);
+        if (address(this).balance > 0) {
+            (bool ok,) = msg.sender.call{value: address(this).balance}("");
+            require(ok);
+        }
     }
 
     /**
@@ -1100,32 +1112,28 @@ contract ETHCoinMiningPool is ERC20, Ownable, ReentrancyGuard, IUniswapV3Pool {
         require(!miningPaused, "Mining is paused");
 
         uint256 blockNumber = ETHC.blockNumber();
-        uint256 lastBlockMiners = ETHC.minersOfBlockCount(blockNumber) * lastBlockWeight;
-        uint256 nextBlockMiners = ETHC.minersOfBlockCount(blockNumber + 1) * currentBlockWeight;
-        IETHC.Block memory nextBlock = ETHC.blocks(blockNumber + 1);
+        uint256 blockReward = _cumulativeMiningReward(
+            blockNumber + 1, blockNumber + blockCounts, ETHC.nextHalvingBlock(), ETHC.halvingInterval()
+        ) / blockCounts;
 
-        uint256 blockReward = nextBlock.miningReward == 0 ? ETHC.miningReward() : nextBlock.miningReward;
-
-        // Calculate shares for a single block
-        uint256 weightedAvgMiners = (lastBlockMiners + nextBlockMiners) / (lastBlockWeight + currentBlockWeight);
-        uint256 shares = blockReward * mineCount / weightedAvgMiners;
-
-        // Calculate total shares and fees across all blocks
-        uint256 feeAmount = shares * operatorFeeNum / operatorFeeDenom;
-        uint256 totalShares = (shares - feeAmount) * blockCounts;
-        uint256 totalFeeAmount = feeAmount * blockCounts;
+        (uint256 shares, uint256 fee) = _calculateSharesAndFee(mineCount, blockCounts, blockNumber, blockReward);
 
         // Execute future mining through vault
-        vault.futureMine{value: msg.value}(mineCount, blockCounts);
+        vault.futureMine{value: mineCount * blockCounts * ETHC.mineCost()}(mineCount, blockCounts);
 
-        // Mint total shares to miner and operator
-        _mint(msg.sender, totalShares);
-        if (totalFeeAmount > 0) {
-            _mint(operatorAddress, totalFeeAmount);
-            emit FeeCollected(msg.sender, totalFeeAmount);
+        // Mint shares to miner and operator
+        _mint(msg.sender, shares);
+        if (fee > 0 && operatorAddress != address(0)) {
+            _mint(operatorAddress, fee);
+        } else if (operatorAddress == address(0)) {
+            _mint(msg.sender, fee);
         }
 
-        emit FutureMiningExecuted(msg.sender, mineCount, blockCounts, blockReward, totalShares, totalFeeAmount);
+        emit FutureMiningExecuted(msg.sender, blockNumber + 1, mineCount, blockCounts, blockReward, shares, fee);
+        if (address(this).balance > 0) {
+            (bool ok,) = msg.sender.call{value: address(this).balance}("");
+            require(ok);
+        }
     }
 
     /**
@@ -1304,6 +1312,77 @@ contract ETHCoinMiningPool is ERC20, Ownable, ReentrancyGuard, IUniswapV3Pool {
         reward = ETHC.balanceOf(address(vault)) * amount / totalSupply();
     }
 
+    function miningReward(uint256 blockNumber) external view returns (uint256 blockReward) {
+        blockReward = _miningRewardViewOnly(blockNumber);
+    }
+
+    function _miningRewardViewOnly(uint256 blockNumber) internal view returns (uint256 blockReward) {
+        blockReward = blockRewardCache[blockNumber];
+
+        if (blockReward == 0) {
+            uint256 nextHalvingBlock = ETHC.nextHalvingBlock();
+            uint256 currentBlockReward = ETHC.miningReward();
+            uint256 halvingInterval = ETHC.halvingInterval();
+            while (blockNumber >= nextHalvingBlock) {
+                currentBlockReward = currentBlockReward / 2;
+                halvingInterval = halvingInterval * 2;
+                nextHalvingBlock = nextHalvingBlock + halvingInterval;
+            }
+            blockReward = currentBlockReward;
+        }
+    }
+
+    function _miningReward(uint256 blockNumber) internal returns (uint256 blockReward) {
+        blockReward = _miningRewardViewOnly(blockNumber);
+        blockRewardCache[blockNumber] = blockReward;
+    }
+
+    function _cumulativeMiningReward(
+        uint256 startingBlockNumber,
+        uint256 endingBlockNumber,
+        uint256 nextHalvingBlock,
+        uint256 halvingInterval
+    ) internal returns (uint256 blockReward) {
+        require(startingBlockNumber <= endingBlockNumber);
+        if (endingBlockNumber < nextHalvingBlock) {
+            return _miningReward(startingBlockNumber) * (1 + endingBlockNumber - startingBlockNumber);
+        } else {
+            return _cumulativeMiningReward(startingBlockNumber, nextHalvingBlock - 1, nextHalvingBlock, halvingInterval)
+                + _cumulativeMiningReward(
+                    nextHalvingBlock, endingBlockNumber, nextHalvingBlock + (halvingInterval * 2), halvingInterval * 2
+                );
+        }
+    }
+
+    function calculateSharesAndFee(uint256 mineCount, uint256 blockCount)
+        external
+        view
+        returns (uint256 shares, uint256 fee)
+    {
+        uint256 blockNumber = ETHC.blockNumber();
+        uint256 blockReward = _miningRewardViewOnly(blockNumber + 1);
+
+        (shares, fee) = _calculateSharesAndFee(mineCount, blockCount, blockNumber, blockReward);
+    }
+
+    function _calculateSharesAndFee(uint256 mineCount, uint256 blockCount, uint256 blockNumber, uint256 blockReward)
+        internal
+        view
+        returns (uint256 shares, uint256 fee)
+    {
+        uint256 lastBlockMiners = ETHC.minersOfBlockCount(blockNumber) * lastBlockWeight;
+        uint256 nextBlockMiners = ETHC.minersOfBlockCount(blockNumber + 1) * currentBlockWeight;
+
+        // Calculate shares for a single block
+        uint256 weightedAvgMiners = (lastBlockMiners + nextBlockMiners) / (lastBlockWeight + currentBlockWeight);
+        uint256 blockShares = blockReward * mineCount / weightedAvgMiners;
+
+        // Calculate total shares and fees across all blocks
+        uint256 blockFeeAmount = blockShares * operatorFeeNum / operatorFeeDenom;
+        shares = (blockShares - blockFeeAmount) * blockCount;
+        fee = blockFeeAmount * blockCount;
+    }
+
     /**
      * @notice Fallback function to handle direct ETH transfers for mining
      * @dev Automatically converts received ETH into mining operations
@@ -1347,11 +1426,6 @@ contract ETHCoinMiningPool is ERC20, Ownable, ReentrancyGuard, IUniswapV3Pool {
     receive() external payable {
         uint256 mineCost = ETHC.mineCost();
         uint256 mineCount = msg.value / mineCost;
-        uint256 mineValue = mineCount * mineCost;
-        _mine(mineCount, mineValue);
-        if (address(this).balance > 0) {
-            (bool ok,) = msg.sender.call{value: address(this).balance}("");
-            require(ok);
-        }
+        _mine(mineCount);
     }
 }
